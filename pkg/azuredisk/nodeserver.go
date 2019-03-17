@@ -17,6 +17,7 @@ limitations under the License.
 package azuredisk
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -24,25 +25,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/glog"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog"
 
-	"golang.org/x/net/context"
-
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 const (
-	defaultFsType = "ext4"
+	defaultFsType           = "ext4"
+	defaultAzureVolumeLimit = 16
 )
+
+// store vm size list in current region
+var vmSizeList *[]compute.VirtualMachineSize
 
 // NodeStageVolume mount disk device to a staging path
 func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	glog.V(4).Infof("NodeStageVolume: called with args %+v", *req)
+	klog.V(4).Infof("NodeStageVolume: called with args %+v", *req)
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -114,20 +118,20 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 
 	// FormatAndMount will format only if needed
-	glog.V(2).Infof("NodeStageVolume: formatting %s and mounting at %s", newDevicePath, target)
+	klog.V(2).Infof("NodeStageVolume: formatting %s and mounting at %s", newDevicePath, target)
 	err = d.mounter.FormatAndMount(newDevicePath, target, fsType, nil)
 	if err != nil {
 		msg := fmt.Sprintf("could not format %q and mount it at %q", lun, target)
 		return nil, status.Error(codes.Internal, msg)
 	}
-	glog.V(2).Infof("NodeStageVolume: format %s and mounting at %s successfully.", newDevicePath, target)
+	klog.V(2).Infof("NodeStageVolume: format %s and mounting at %s successfully.", newDevicePath, target)
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 // NodeUnstageVolume unmount disk device from a staging path
 func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	glog.V(2).Infof("NodeUnstageVolume: called with args %+v", *req)
+	klog.V(2).Infof("NodeUnstageVolume: called with args %+v", *req)
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -138,12 +142,12 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
-	glog.V(2).Infof("NodeUnstageVolume: unmounting %s", target)
+	klog.V(2).Infof("NodeUnstageVolume: unmounting %s", target)
 	err := d.mounter.Unmount(target)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not unmount target %q: %v", target, err)
 	}
-	glog.V(2).Infof("NodeUnstageVolume: unmount %s successfully", target)
+	klog.V(2).Infof("NodeUnstageVolume: unmount %s successfully", target)
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -169,7 +173,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 	notMnt, err := d.mounter.IsLikelyNotMountPoint(target)
 	if err != nil && !os.IsNotExist(err) {
-		glog.V(2).Infof("azureDisk - cannot validate mount point for on %s, error: %v", target, err)
+		klog.V(2).Infof("azureDisk - cannot validate mount point for on %s, error: %v", target, err)
 		return nil, err
 	}
 
@@ -177,13 +181,13 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		// testing original mount point, make sure the mount link is valid
 		_, err := ioutil.ReadDir(target)
 		if err == nil {
-			glog.V(2).Infof("azureDisk - already mounted to target %s", target)
+			klog.V(2).Infof("azureDisk - already mounted to target %s", target)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
 		// mount link is invalid, now unmount and remount later
-		glog.Warningf("azureDisk - ReadDir %s failed with %v, unmount this directory", target, err)
+		klog.Warningf("azureDisk - ReadDir %s failed with %v, unmount this directory", target, err)
 		if err := d.mounter.Unmount(target); err != nil {
-			glog.Errorf("azureDisk - Unmount directory %s failed with %v", target, err)
+			klog.Errorf("azureDisk - Unmount directory %s failed with %v", target, err)
 			return nil, err
 		}
 		// notMnt = true
@@ -192,7 +196,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	if runtime.GOOS != "windows" {
 		// in windows, we will use mklink to mount, will MkdirAll in Mount func
 		if err := os.MkdirAll(target, 0750); err != nil {
-			glog.Errorf("azureDisk - mkdir failed on target: %s (%v)", target, err)
+			klog.Errorf("azureDisk - mkdir failed on target: %s (%v)", target, err)
 			return nil, err
 		}
 	}
@@ -205,7 +209,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	attrib := req.GetVolumeContext()
 	mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
 
-	glog.V(2).Infof("target %v\nfstype %v\n\nreadonly %v\nvolumeId %v\nContext %v\nmountflags %v\n",
+	klog.V(2).Infof("target %v\nfstype %v\n\nreadonly %v\nvolumeId %v\nContext %v\nmountflags %v\n",
 		target, fsType, readOnly, volumeID, attrib, mountFlags)
 
 	mountOptions := []string{"bind"}
@@ -214,17 +218,17 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	}
 	mountOptions = util.JoinMountOptions(mountFlags, mountOptions)
 
-	glog.V(2).Infof("NodePublishVolume: creating dir %s", target)
+	klog.V(2).Infof("NodePublishVolume: creating dir %s", target)
 	if err := d.mounter.MakeDir(target); err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not create dir %q: %v", target, err)
 	}
 
-	glog.V(2).Infof("NodePublishVolume: mounting %s at %s", source, target)
+	klog.V(2).Infof("NodePublishVolume: mounting %s at %s", source, target)
 	if err := d.mounter.Mount(source, target, "ext4", mountOptions); err != nil {
 		os.Remove(target)
 		return nil, status.Errorf(codes.Internal, "Could not mount %q at %q: %v", source, target, err)
 	}
-	glog.V(2).Infof("NodePublishVolume: mount %s at %s successfully", source, target)
+	klog.V(2).Infof("NodePublishVolume: mount %s at %s successfully", source, target)
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
@@ -240,19 +244,19 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
 
-	glog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s", volumeID, targetPath)
+	klog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s", volumeID, targetPath)
 	err := d.mounter.Unmount(req.GetTargetPath())
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	glog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
+	klog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
 // NodeGetCapabilities return the capabilities of the Node plugin
 func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	glog.V(2).Infof("Using default NodeGetCapabilities")
+	klog.V(2).Infof("Using default NodeGetCapabilities")
 
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: d.NSCap,
@@ -261,11 +265,51 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 
 // NodeGetInfo return info of the node on which this plugin is running
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	glog.V(5).Infof("Using default NodeGetInfo")
+	klog.V(5).Infof("Using default NodeGetInfo")
+
+	instances, ok := d.cloud.Instances()
+	if !ok {
+		return nil, status.Error(codes.Internal, "Failed to get instances from cloud provider")
+	}
+
+	instanceType, err := instances.InstanceType(context.TODO(), types.NodeName(d.NodeID))
+	if err != nil {
+		return nil, status.Error(codes.Internal, "Failed to get instance type from Azure cloud provider, nodeName: "+d.NodeID)
+	}
+
+	if vmSizeList == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		result, err := d.cloud.VirtualMachineSizesClient.List(ctx, d.cloud.Location)
+		if err != nil || result.Value == nil {
+			return nil, status.Error(codes.Internal, "failed to list vm sizes in GetVolumeLimits from Azure cloud provider, nodeName: "+d.NodeID)
+		}
+		vmSizeList = result.Value
+	}
 
 	return &csi.NodeGetInfoResponse{
-		NodeId: d.NodeID,
+		NodeId:            d.NodeID,
+		MaxVolumesPerNode: getMaxDataDiskCount(instanceType, vmSizeList),
 	}, nil
+}
+
+func getMaxDataDiskCount(instanceType string, sizeList *[]compute.VirtualMachineSize) int64 {
+	if sizeList == nil {
+		return defaultAzureVolumeLimit
+	}
+
+	vmsize := strings.ToUpper(instanceType)
+	for _, size := range *sizeList {
+		if size.Name == nil || size.MaxDataDiskCount == nil {
+			klog.Errorf("failed to get vm size in getMaxDataDiskCount")
+			continue
+		}
+		if strings.ToUpper(*size.Name) == vmsize {
+			klog.V(12).Infof("got a matching size in getMaxDataDiskCount, Name: %s, MaxDataDiskCount: %d", *size.Name, *size.MaxDataDiskCount)
+			return int64(*size.MaxDataDiskCount)
+		}
+	}
+	return defaultAzureVolumeLimit
 }
 
 func (d *Driver) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {

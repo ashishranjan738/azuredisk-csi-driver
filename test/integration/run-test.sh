@@ -36,7 +36,7 @@ fi
 echo "being to run integration test on $cloud ..."
 
 # run CSI driver as a background service
-_output/azurediskplugin --endpoint $endpoint --nodeid CSINode -v=5 &
+_output/azurediskplugin --endpoint $endpoint --nodeid $node -v=5 &
 if [ $cloud = "AzureChinaCloud" ]; then
 	sleep 20
 else
@@ -45,6 +45,12 @@ fi
 
 # begin to run CSI functions one by one
 if [ -v aadClientSecret ]; then
+	$csc node get-info --endpoint $endpoint
+	retcode=$?
+	if [ $retcode -gt 0 ]; then
+		exit $retcode
+	fi
+
 	echo "create volume test:"
 	value=`$csc controller new --endpoint $endpoint --cap 1,block CSIVolumeName  --req-bytes 2147483648 --params skuname=Standard_LRS,kind=managed`
 	retcode=$?
@@ -55,6 +61,12 @@ if [ -v aadClientSecret ]; then
 
 	volumeid=`echo $value | awk '{print $1}' | sed 's/"//g'`
 	echo "got volume id: $volumeid"
+
+	$csc controller validate-volume-capabilities --endpoint $endpoint --cap 1,block $volumeid
+	retcode=$?
+	if [ $retcode -gt 0 ]; then
+		exit $retcode
+	fi
 
 	echo "attach volume test:"
 	$csc controller publish --endpoint $endpoint --node-id $node --cap 1,block $volumeid
@@ -82,18 +94,6 @@ if [ -v aadClientSecret ]; then
 fi
 
 $csc identity plugin-info --endpoint $endpoint
-retcode=$?
-if [ $retcode -gt 0 ]; then
-	exit $retcode
-fi
-
-$csc controller validate-volume-capabilities --endpoint $endpoint --cap 1,block CSIVolumeID
-retcode=$?
-if [ $retcode -gt 0 ]; then
-	exit $retcode
-fi
-
-$csc node get-info --endpoint $endpoint
 retcode=$?
 if [ $retcode -gt 0 ]; then
 	exit $retcode

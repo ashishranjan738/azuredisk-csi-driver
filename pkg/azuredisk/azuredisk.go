@@ -17,6 +17,7 @@ limitations under the License.
 package azuredisk
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -25,8 +26,8 @@ import (
 	"k8s.io/kubernetes/pkg/util/mount"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/csi-driver/azuredisk-csi-driver/pkg/csi-common"
-	"github.com/golang/glog"
+	csicommon "github.com/kubernetes-sigs/azuredisk-csi-driver/pkg/csi-common"
+	"k8s.io/klog"
 )
 
 const (
@@ -52,7 +53,7 @@ type Driver struct {
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
 func NewDriver(nodeID string) *Driver {
 	if nodeID == "" {
-		glog.Fatalln("NodeID missing")
+		klog.Fatalln("NodeID missing")
 		return nil
 	}
 
@@ -67,12 +68,12 @@ func NewDriver(nodeID string) *Driver {
 
 // Run driver initialization
 func (d *Driver) Run(endpoint string) {
-	glog.Infof("Driver: %v ", driverName)
-	glog.Infof("Version: %s", vendorVersion)
+	klog.Infof("Driver: %v ", driverName)
+	klog.Infof("Version: %s", vendorVersion)
 
 	cloud, err := GetCloudProvider()
 	if err != nil {
-		glog.Fatalln("failed to get Azure Cloud Provider")
+		klog.Fatalln("failed to get Azure Cloud Provider")
 	}
 	d.cloud = cloud
 
@@ -117,4 +118,31 @@ func getDiskName(diskURI string) (string, error) {
 		return "", fmt.Errorf("could not get disk name from %s, correct format: %s", diskURI, diskPathRE)
 	}
 	return matches[1], nil
+}
+
+func getResourceGroupFromDiskURI(diskURI string) (string, error) {
+	fields := strings.Split(diskURI, "/")
+	if len(fields) != 9 || fields[3] != "resourceGroups" {
+		return "", fmt.Errorf("invalid disk URI: %s", diskURI)
+	}
+	return fields[4], nil
+}
+
+func (d *Driver) checkDiskExists(ctx context.Context, diskURI string) error {
+	diskName, err := getDiskName(diskURI)
+	if err != nil {
+		return err
+	}
+
+	resourceGroup, err := getResourceGroupFromDiskURI(diskURI)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
